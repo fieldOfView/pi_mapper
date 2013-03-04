@@ -30,30 +30,25 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdio.h>
 #include <assert.h>
 #include <pthread.h>
+#include <stdbool.h>
 
 #include "bcm_host.h"
+#include "png.h"
 
 #include "GLES2/gl2.h"
 #include "EGL/egl.h"
 #include "EGL/eglext.h"
 
-#define VIDEO_PATH "/opt/vc/src/hello_pi/hello_video/test.h264"
-#define VIDEO_WIDTH 1920
-#define VIDEO_HEIGHT 1080
-
-#define MAP_PATH "map.raw"
-#define MAP_WIDTH 1680
-#define MAP_HEIGHT 1050
-
 typedef struct
 {
-	char* filename;	
+	char* filename;
+	bool loop;
 	void* egl_image;
 } VIDEO_INFO;
 
 typedef struct
 {
-	int verbose;
+	bool verbose;
 	
 	uint32_t screen_width;
 	uint32_t screen_height;
@@ -71,21 +66,19 @@ typedef struct
 	GLuint attrib_vertex;
 	GLuint uniform_mapMsb, uniform_mapLsb;
 	GLuint uniform_source;
-	
-	// pointers to texture buffers
-	char *texture_buffer1;
-	char *texture_buffer2;
 
 	// video texture
 	void* egl_image;
 	pthread_t video_thread;
+	
+	int frame_available;
 } APP_STATE_T;
 static APP_STATE_T _state, *state=&_state;
 
-static int frame_available = 0;
 
 // forward declaration
-void* video_decode_test(void* arg);
+void* video_decode(void* arg);
+int video_decode_dimensions(char *filename, int *frame_width, int *frame_height);
 
 
 
@@ -96,7 +89,8 @@ static void show_shaderlog(GLint shader)
 	// Prints the compile log for a shader
 	char log[1024];
 	glGetShaderInfoLog(shader,sizeof log,NULL,log);
-	printf("Shader (%d): %s\n", shader, log);
+	if (log[0]!=0)
+		printf("Shader (%d): %s\n", shader, log);
 }
 
 static void show_programlog(GLint shader)
@@ -104,7 +98,8 @@ static void show_programlog(GLint shader)
 	// Prints the information log for a program object
 	char log[1024];
 	glGetProgramInfoLog(shader,sizeof log,NULL,log);
-	printf("Program (%d): %s\n", shader, log);
+	if (log[0]!=0)
+		printf("Program (%d): %s\n", shader, log);
 }
 
 /***********************************************************
@@ -214,9 +209,12 @@ static void init_ogl()
 	checkgl();
 
 	// Set background color and clear buffers
-	glClearColor(0.15f, 0.25f, 0.35f, 1.0f);
+	glClearColor(0.f, 0.f, 0.f, 1.f);
 	glClear( GL_COLOR_BUFFER_BIT );
-
+	checkgl();
+	
+	// create 3 EGL texture surfaces; 2 map textures and a video texture
+	glGenTextures(3, &state->texture[0]);
 	checkgl();
 }
 
@@ -235,7 +233,6 @@ static void init_shaders()
 		"void main(void) {"
 		"  gl_Position = vertex;"
 		"  tcoord = vertex.xy*0.5+0.5;"
-		"  tcoord.y = 1.0 - tcoord.y;"
 		"}";
 
 	// UV Mapping fragment shader, flips source vertically
@@ -301,76 +298,195 @@ static void init_shaders()
 }
 
 
-static void load_map()
+static int load_map(const char * file_name)
 {
-	FILE *file = NULL;
-	int bytes_read, 
-		map_sz = MAP_WIDTH*MAP_HEIGHT*4;
+	png_byte header[8];
 
-	char *map_buffer = malloc(map_sz*2);
-	state->texture_buffer1 = malloc(map_sz);
-	state->texture_buffer2 = malloc(map_sz);
-
-	file = fopen(MAP_PATH, "rb");
-	if (file && map_buffer)
+	if (state->verbose)
+		printf("Loading map\n");		
+	
+	FILE *fp = fopen(file_name, "rb");
+	if (fp == 0)
 	{
-		bytes_read=fread(map_buffer, 1, map_sz*2, file);
-		assert(bytes_read == map_sz*2);  // some problem with file?
-		fclose(file);
-
-		if (state->verbose)
-			printf("Map loaded\n");
-
-	  int i;
-		for(i = 0; i < map_sz; i++)
-		{
-			state->texture_buffer1[i] = map_buffer[2*i];
-			state->texture_buffer2[i] = map_buffer[2*i+1];
-		}
-		if (state->verbose)
-			printf("Map split\n");
+		perror(file_name);
+		return -1;
 	}
 
-	free(map_buffer);
-}
+	// read the header
+	fread(header, 1, 8, fp);
+
+	if (png_sig_cmp(header, 0, 8))
+	{
+		printf("error: %s is not a PNG.\n", file_name);
+		fclose(fp);
+		return -1;
+	}
+
+	png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+	if (!png_ptr)
+	{
+		printf("error: png_create_read_struct returned 0.\n");
+		fclose(fp);
+		return -1;
+	}
+
+	// create png info struct
+	png_infop info_ptr = png_create_info_struct(png_ptr);
+	if (!info_ptr)
+	{
+		printf("error: png_create_info_struct returned 0.\n");
+		png_destroy_read_struct(&png_ptr, (png_infopp)NULL, (png_infopp)NULL);
+		fclose(fp);
+		return -1;
+	}
+
+	// create png info struct
+	png_infop end_info = png_create_info_struct(png_ptr);
+	if (!end_info)
+	{
+		printf("error: png_create_info_struct returned 0.\n");
+		png_destroy_read_struct(&png_ptr, &info_ptr, (png_infopp) NULL);
+		fclose(fp);
+		return -1;
+	}
+
+	// the code in this if statement gets called if libpng encounters an error
+	if (setjmp(png_jmpbuf(png_ptr))) {
+		printf("error from libpng\n");
+		png_destroy_read_struct(&png_ptr, &info_ptr, &end_info);
+		fclose(fp);
+		return -1;
+	}
+
+	// init png reading
+	png_init_io(png_ptr, fp);
+
+	// let libpng know you already read the first 8 bytes
+	png_set_sig_bytes(png_ptr, 8);
+
+	// read all the info up to the image data
+	png_read_info(png_ptr, info_ptr);
+
+	// variables to pass to get info
+	int bit_depth, color_type;
+	png_uint_32 temp_width, temp_height;
+
+	// get info about png
+	png_get_IHDR(png_ptr, info_ptr, &temp_width, &temp_height, &bit_depth, &color_type,
+		NULL, NULL, NULL);
+		
+	if(bit_depth!=16)
+	{
+		printf("error: expected 16 bit per channel map\n");
+		return -1;
+	}
+	if(color_type!=PNG_COLOR_TYPE_RGB_ALPHA)
+	{
+		printf("error: expected RGBA map\n");
+		return -1;
+	}
+
+	// Update the png info struct.
+	png_read_update_info(png_ptr, info_ptr);
+
+	// Row size in bytes.
+	int rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+
+	// glTexImage2d requires rows to be 4-byte aligned
+	rowbytes += 3 - ((rowbytes-1) % 4);
+
+	// Allocate the image_data as a big block, to be given to opengl
+	png_byte * image_data;
+	image_data = malloc(rowbytes * temp_height * sizeof(png_byte)+15);
+	if (image_data == NULL)
+	{
+		printf("error: could not allocate memory for PNG image data\n");
+		png_destroy_read_struct(&png_ptr, &info_ptr, &end_info);
+		fclose(fp);
+		return -1;
+	}
+
+	// row_pointers is for pointing to image_data for reading the png with libpng
+	png_bytep * row_pointers = malloc(temp_height * sizeof(png_bytep));
+	if (row_pointers == NULL)
+	{
+		printf("error: could not allocate memory for PNG row pointers\n");
+		png_destroy_read_struct(&png_ptr, &info_ptr, &end_info);
+		free(image_data);
+		fclose(fp);
+		return -1;
+	}
+
+	// set the individual row_pointers to point at the correct offsets of image_data
+	int i;
+	for (i = 0; i < temp_height; i++)
+	{
+		row_pointers[temp_height - 1 - i] = image_data + i * rowbytes;
+	}
 
 
-static void init_textures()
-{
-	// load texture buffers into OGL|ES texture surfaces
-	load_map();
-	glGenTextures(3, &state->texture[0]);
-	checkgl();
+	if (state->verbose)
+		printf("Splitting map\n");	
+
+	// read the png into image_data through row_pointers
+	png_read_image(png_ptr, row_pointers);
+	
+	// split 16 image into two 8 bit imagebuffers
+	int map_sz = rowbytes * temp_height / 2;
+	char* texture_buffer1 = malloc(map_sz);
+	char* texture_buffer2 = malloc(map_sz);
+
+	for(i = 0; i < map_sz; i++)
+	{
+		texture_buffer1[i] = image_data[2*i];
+		texture_buffer2[i] = image_data[2*i+1];
+	}
 
 	// first texture (map msb)
 	glBindTexture(GL_TEXTURE_2D, state->texture[0]);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MAP_WIDTH, MAP_HEIGHT, 0,
-					 GL_RGBA, GL_UNSIGNED_BYTE, state->texture_buffer1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, temp_width, temp_height, 0,
+					 GL_RGBA, GL_UNSIGNED_BYTE, texture_buffer1);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	checkgl();
 
 	// second texture (map lsb)
 	glBindTexture(GL_TEXTURE_2D, state->texture[1]);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MAP_WIDTH, MAP_HEIGHT, 0,
-					 GL_RGBA, GL_UNSIGNED_BYTE, state->texture_buffer2);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, temp_width, temp_height, 0,
+					 GL_RGBA, GL_UNSIGNED_BYTE, texture_buffer2);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	checkgl();
+	
+	// release texture buffers
+	free(texture_buffer1);
+	free(texture_buffer2);	
+	
+	// clean up
+	png_destroy_read_struct(&png_ptr, &info_ptr, &end_info);
+	free(image_data);
+	free(row_pointers);
+	fclose(fp);
+	
+	return 0;
+}
 
+
+static int make_video_texture(int video_width, int video_height)
+{
 	// setup texture for video
-	int image_size = VIDEO_WIDTH * VIDEO_HEIGHT * 4;
+	int image_size = video_width * video_height * 4;
 	GLubyte* image_buffer = malloc(image_size);
 	if (image_buffer == 0)
 	{
-		printf("malloc failed.\n");
-		exit(1);
+		printf("error: could not allocate memory for video buffer.\n");
+		return -1;
 	}
 
 	memset(image_buffer, 0x00, image_size);  // black transparant
 
 	glBindTexture(GL_TEXTURE_2D, state->texture[2]);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VIDEO_WIDTH, VIDEO_HEIGHT, 0,
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video_width, video_height, 0,
 					 GL_RGBA, GL_UNSIGNED_BYTE, image_buffer);
 
 	free(image_buffer);
@@ -380,7 +496,7 @@ static void init_textures()
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	
-	/* Create EGL Image */
+	// Create EGL Image
 	state->egl_image = 0;
 	state->egl_image = eglCreateImageKHR(
 					 state->display,
@@ -391,26 +507,51 @@ static void init_textures()
 	 
 	if (state->egl_image == EGL_NO_IMAGE_KHR)
 	{
-		printf("eglCreateImageKHR failed.\n");
-		exit(1);
+		printf("error: eglCreateImageKHR failed.\n");
+		return -1;
 	}
-	else
-	{
-		if (state->verbose)
-			printf("EGL image created = %x\n", (uint)state->egl_image);
-	}	
 
+	if (state->verbose)
+		printf("EGL image created = %x\n", (uint)state->egl_image);
+		
+	return 0;
+}
+
+static void init_textures(char *map_filename, char *video_filename)
+{
+	if(load_map(map_filename)<0)
+	{
+		exit(-1);
+	}
+
+	int frame_width, frame_height;
+	if(video_decode_dimensions(video_filename, &frame_width, &frame_height)<0)
+	{
+		printf("error: could not get video dimensions.\n");
+		exit(-1);		
+	}
+	if (state->verbose)
+		printf("Video dimensions: %d x %d\n", frame_width, frame_height);
+		
+	if(make_video_texture(frame_width, frame_height)<0)
+	{
+		exit(-1);
+	}
+}
+
+static void start_rendering(char *video_filename, bool loop)
+{
 	VIDEO_INFO video_info;
 	memset( &video_info, 0, sizeof( video_info ) );
-	char* filename = VIDEO_PATH;
-	video_info.filename = filename;
+	video_info.filename = video_filename;
+	video_info.loop = loop;
 	video_info.egl_image = state->egl_image;
 	
 	// Start rendering
-	pthread_create(&state->video_thread, NULL, video_decode_test, &video_info);	
+	pthread_create(&state->video_thread, NULL, video_decode, &video_info);	
 
 	if (state->verbose)
-		printf("Textures ready\n");
+		printf("Video thread created\n");
 }
 
 static void draw_triangles()
@@ -458,7 +599,7 @@ static void draw_triangles()
 
 void set_frame_available()
 {
-	frame_available = 1;
+	state->frame_available = 1;
 }
 
 static void cleanup(void)
@@ -482,17 +623,13 @@ static void cleanup(void)
 	eglDestroyContext( state->display, state->context );
 	eglTerminate( state->display );
 
-	// release texture buffers
-	free(state->texture_buffer1);
-	free(state->texture_buffer2);
-
 	if (state->verbose)
 		printf("App closed\n");
 }
 
 //==============================================================================
 
-int main ()
+int main (int argc, char **argv)
 {
 	int terminate = 0;
 	
@@ -501,18 +638,35 @@ int main ()
 	
 	// Clear application state
 	memset( state, 0, sizeof( *state ) );
-	state->verbose = 1;
 
+	if (argc < 3) {
+		printf("Usage: %s [OPTION] <mapfile> <moviefile>\n", argv[0]);
+		printf("  -l, --loop						Loop playback forever\n");
+		printf("  -v, --verbose						Show debug information\n");
+		exit(1);
+	}
+	
+	bool loop = false;
+	int c;
+	for(c=1; c<argc-1; c++) {
+		if (strcmp(argv[c],"-l")==0 || strcmp(argv[c],"--loop") == 0)
+			loop = true;
+		if (strcmp(argv[c],"-v")==0 || strcmp(argv[c],"--verbose") == 0)
+			state->verbose = true;
+	}
+		
 	// Start OGLES
 	init_ogl();
+	init_textures(argv[argc-2], argv[argc-1]);
 	init_shaders();
-	init_textures();
+	
+	start_rendering(argv[argc-1], loop);
 
 	while (!terminate)
 	{
-		if (frame_available)
+		if (state->frame_available)
 		{
-			frame_available = 0;
+			state->frame_available = 0;
 			draw_triangles();
 		}
 	}

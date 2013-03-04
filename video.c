@@ -31,13 +31,15 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "bcm_host.h"
 #include "ilclient.h"
 
 typedef struct
 {
-	char* filename;	
+	char* filename;
+	bool loop;
 	void* egl_image;
 } VIDEO_INFO;
 
@@ -46,6 +48,7 @@ static COMPONENT_T* video_render = NULL;
 
 // forward declaration
 void set_frame_available();
+
 
 void my_fill_buffer_done(void* data, COMPONENT_T* comp)
 {
@@ -61,12 +64,11 @@ void my_fill_buffer_done(void* data, COMPONENT_T* comp)
 
 
 
-void* video_decode_test(VIDEO_INFO* arg)
+void* video_decode(VIDEO_INFO* arg)
 {
 	VIDEO_INFO videoInfo = *arg;
-	void* eglImage = videoInfo.egl_image;
 
-	if (eglImage == 0)
+	if (videoInfo.egl_image == 0)
 	{
 		printf("eglImage is null.\n");
 		exit(1);
@@ -80,9 +82,7 @@ void* video_decode_test(VIDEO_INFO* arg)
 	ILCLIENT_T *client;
 	FILE *in;
 	int status = 0;
-	unsigned char *data = NULL;
 	unsigned int data_len = 0;
-	int find_start_codes = 0;
 	int packet_size = 16<<10;
 
 	memset(list, 0, sizeof(list));
@@ -104,15 +104,6 @@ void* video_decode_test(VIDEO_INFO* arg)
 		return (void *)-4;
 	}
 
-	if(find_start_codes && (data = malloc(packet_size+4)) == NULL)
-	{
-		status = -16;
-		if(OMX_Deinit() != OMX_ErrorNone)
-			status = -17;
-		ilclient_destroy(client);
-		fclose(in);
-		return (void *)status;
-	}
 
 	// callback
 	ilclient_set_fill_buffer_done_callback(client, my_fill_buffer_done, 0);
@@ -158,7 +149,7 @@ void* video_decode_test(VIDEO_INFO* arg)
 
 	if(status == 0)
 		ilclient_change_component_state(video_decode, OMX_StateIdle);
-
+		
 	memset(&format, 0, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
 	format.nSize = sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE);
 	format.nVersion.nVersion = OMX_VERSION;
@@ -178,13 +169,13 @@ void* video_decode_test(VIDEO_INFO* arg)
 		while((buf = ilclient_get_input_buffer(video_decode, 130, 1)) != NULL)
 		{
 			// feed data and wait until we get port settings changed
-			unsigned char *dest = find_start_codes ? data + data_len : buf->pBuffer;
+			unsigned char *dest = buf->pBuffer;
 
 			// loop if at end
 			if (feof(in))
 				rewind(in);
 
-			data_len += fread(dest, 1, packet_size+(find_start_codes*4)-data_len, in);
+			data_len += fread(dest, 1, packet_size-data_len, in);
 
 			if(port_settings_changed == 0 &&
 				((data_len > 0 && ilclient_remove_event(video_decode, OMX_EventPortSettingsChanged, 131, 0, 0, 1) == 0) ||
@@ -221,7 +212,7 @@ void* video_decode_test(VIDEO_INFO* arg)
 					exit(1);
 				}
 
-				if (OMX_UseEGLImage(ILC_GET_HANDLE(video_render), &eglBuffer, 221, NULL, eglImage) != OMX_ErrorNone)
+				if (OMX_UseEGLImage(ILC_GET_HANDLE(video_render), &eglBuffer, 221, NULL, videoInfo.egl_image) != OMX_ErrorNone)
 				{
 					printf("OMX_UseEGLImage failed.\n");
 					exit(1);
@@ -242,53 +233,8 @@ void* video_decode_test(VIDEO_INFO* arg)
 			if(!data_len)
 				break;
 
-			if(find_start_codes)
-			{
-				int i, start = -1, len = 0;
-				int max_len = data_len > packet_size ? packet_size : data_len;
-				for(i=2; i<max_len; i++)
-				{
-					if(data[i-2] == 0 && data[i-1] == 0 && data[i] == 1)
-					{
-						len = 3;
-						start = i-2;
-
-						// check for 4 byte start code
-						if(i > 2 && data[i-3] == 0)
-						{
-							len++;
-							start--;
-						}
-
-						break;
-					}
-				}
-
-				if(start == 0)
-				{
-					// start code is next, so just send that
-					buf->nFilledLen = len;
-				}
-				else if(start == -1)
-				{
-					// no start codes seen, send the first block
-					buf->nFilledLen = max_len;
-				}
-				else
-				{
-					// start code in the middle of the buffer, send up to the code
-					buf->nFilledLen = start;
-				}
-
-				memcpy(buf->pBuffer, data, buf->nFilledLen);
-				memmove(data, data + buf->nFilledLen, data_len - buf->nFilledLen);
-				data_len -= buf->nFilledLen;
-			}
-			else
-			{
-				buf->nFilledLen = data_len;
-				data_len = 0;
-			}
+			buf->nFilledLen = data_len;
+			data_len = 0;
 
 			buf->nOffset = 0;
 			if(first_packet)
@@ -339,4 +285,105 @@ void* video_decode_test(VIDEO_INFO* arg)
 
 	ilclient_destroy(client);
 	return (void *)status;
+}
+
+
+
+int video_decode_dimensions(char *filename, int *frame_width, int *frame_height)
+{
+	OMX_PARAM_PORTDEFINITIONTYPE port_definition;
+	OMX_VIDEO_PARAM_PORTFORMATTYPE format;
+	COMPONENT_T *video_decode = NULL;
+	ILCLIENT_T *client;
+	COMPONENT_T *list[2];	
+	FILE *in;
+	int status = 0;
+	unsigned int data_len = 0;
+	int packet_size = 16<<10;	
+	
+	memset(list, 0, sizeof(list));
+
+	if((in = fopen(filename, "rb")) == NULL)
+		return -2;
+
+	if((client = ilclient_init()) == NULL)
+	{
+		fclose(in);
+		return -3;
+	}
+
+	if(OMX_Init() != OMX_ErrorNone)
+	{
+		ilclient_destroy(client);
+		fclose(in);
+		return -4;
+	}
+
+	// create video_decode
+	if(ilclient_create_component(client, &video_decode, "video_decode", ILCLIENT_DISABLE_ALL_PORTS | ILCLIENT_ENABLE_INPUT_BUFFERS) != 0)
+		status = -14;
+	list[0] = video_decode;
+
+	if(status == 0)
+		ilclient_change_component_state(video_decode, OMX_StateIdle);
+
+	memset(&format, 0, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
+	format.nSize = sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE);
+	format.nVersion.nVersion = OMX_VERSION;
+	format.nPortIndex = 130;
+	format.eCompressionFormat = OMX_VIDEO_CodingAVC;
+
+	memset(&port_definition, 0, sizeof(OMX_PARAM_PORTDEFINITIONTYPE));
+	port_definition.nSize = sizeof(OMX_PARAM_PORTDEFINITIONTYPE);
+	port_definition.nVersion.nVersion = OMX_VERSION;
+	port_definition.nPortIndex = 131;	
+	
+	if(status == 0 &&
+		OMX_SetParameter(ILC_GET_HANDLE(video_decode), OMX_IndexParamVideoPortFormat, &format) == OMX_ErrorNone &&
+		ilclient_enable_port_buffers(video_decode, 130, NULL, NULL, NULL) == 0)
+	{
+		OMX_BUFFERHEADERTYPE *buf;
+
+		ilclient_change_component_state(video_decode, OMX_StateExecuting);
+
+		while((buf = ilclient_get_input_buffer(video_decode, 130, 1)) != NULL)
+		{
+			// feed data and wait until we get port settings changed
+			unsigned char *dest = buf->pBuffer;
+			data_len += fread(dest, 1, packet_size-data_len, in);
+
+			if( ((data_len > 0 && ilclient_remove_event(video_decode, OMX_EventPortSettingsChanged, 131, 0, 0, 1) == 0) ||
+				 (data_len == 0 && ilclient_wait_for_event(video_decode, OMX_EventPortSettingsChanged, 131, 0, 0, 1,
+																		 ILCLIENT_EVENT_ERROR | ILCLIENT_PARAMETER_CHANGED, 10000) == 0)))
+			{
+				if(status == 0 &&
+					OMX_GetParameter(ILC_GET_HANDLE(video_decode), OMX_IndexParamPortDefinition, &port_definition) == OMX_ErrorNone)
+				{
+					*frame_width = port_definition.format.video.nFrameWidth;
+					*frame_height = port_definition.format.video.nFrameHeight;
+				}
+				status = 1;
+				break;
+			}
+
+			buf->nFilledLen = data_len;
+			data_len = 0;
+
+			if(OMX_EmptyThisBuffer(ILC_GET_HANDLE(video_decode), buf) != OMX_ErrorNone)
+			{
+				status = -6;
+				break;
+			}
+
+		}
+
+	}
+	close(in);
+
+	ilclient_state_transition(list, OMX_StateIdle);
+	ilclient_cleanup_components(list);
+	
+	OMX_Deinit();
+
+	return status;
 }

@@ -1,6 +1,6 @@
 OBJS=mapper.o video.o
 BIN=uvmapper.bin
-LDFLAGS+=-lilclient
+LDFLAGS+=-lilclient -lpng
 
 include ../Makefile.include
 
