@@ -1,3 +1,4 @@
+
 /*
 Copyright (c) 2012, Broadcom Europe Ltd
 All rights reserved.
@@ -31,6 +32,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <termios.h>
 #include <poll.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include "bcm_host.h"
 
@@ -71,10 +73,20 @@ typedef struct
 	char *texture_buffer1;
 	char *texture_buffer2;
 	char *texture_buffer3;
+
+	// video texture
+	void* egl_image;
+	pthread_t video_thread;
 } APP_STATE_T;
 
 static APP_STATE_T _state, *state=&_state;
 static struct termios last_term, my_term;
+
+static int frame_available = 0;
+
+// forward declaration
+void* video_decode_test(void* arg);
+
 
 
 #define checkgl() assert(glGetError() == 0)
@@ -224,11 +236,12 @@ static void init_shaders(APP_STATE_T *state)
 		"attribute vec4 vertex;"
 		"varying vec2 tcoord;"
 		"void main(void) {"
-		" gl_Position = vertex;"
-		" tcoord = vertex.xy*0.5+0.5;"
-		" tcoord.y = 1.0 - tcoord.y;"
+		"  gl_Position = vertex;"
+		"  tcoord = vertex.xy*0.5+0.5;"
+		"  tcoord.y = 1.0 - tcoord.y;"
 		"}";
 
+	// UV Mapping fragment shader, flips source vertically
 	const GLchar *fshader_source =
 		"varying vec2 tcoord;"
 		"uniform sampler2D mapMsb;"
@@ -236,6 +249,7 @@ static void init_shaders(APP_STATE_T *state)
 		"uniform sampler2D source;"
 		"void main(void) {"
 		"  vec4 uv = texture2D(mapMsb,tcoord) + texture2D(mapLsb,tcoord)/256.;"
+		"  uv.g = 1.0 - uv.g;"
 		"  gl_FragColor.rgb = texture2D(source, uv.xy).rgb;"
 		"  gl_FragColor.a = uv.a;"
 		"}";
@@ -322,17 +336,6 @@ static void load_images(APP_STATE_T *state)
 			printf("Map split\n");
 	}
 
-	file = fopen(IMAGE_PATH, "rb");
-	if (file && state->texture_buffer3)
-	{
-		bytes_read=fread(state->texture_buffer3, 1, image_sz, file);
-		assert(bytes_read == image_sz);  // some problem with file?
-		fclose(file);
-
-		if (state->verbose)
-			printf("Image loaded\n");
-	}
-
 	free(map_buffer);
 }
 
@@ -348,30 +351,66 @@ static void init_textures(APP_STATE_T *state)
 	glBindTexture(GL_TEXTURE_2D, state->texture[0]);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MAP_WIDTH, MAP_HEIGHT, 0,
 					 GL_RGBA, GL_UNSIGNED_BYTE, state->texture_buffer1);
-	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (GLfloat)GL_NEAREST);
-	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (GLfloat)GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	checkgl();
 
 	// second texture (map lsb)
 	glBindTexture(GL_TEXTURE_2D, state->texture[1]);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, MAP_WIDTH, MAP_HEIGHT, 0,
 					 GL_RGBA, GL_UNSIGNED_BYTE, state->texture_buffer2);
-	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (GLfloat)GL_NEAREST);
-	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (GLfloat)GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	checkgl();
 
-	// third texture (image)
+	// setup texture for video
+	int image_size = IMAGE_WIDTH * IMAGE_HEIGHT * 4;
+	GLubyte* image_buffer = malloc(image_size);
+	if (image_buffer == 0)
+	{
+		printf("malloc failed.\n");
+		exit(1);
+	}
+
+	memset(image_buffer, 0x00, image_size);  // black transparant
+
 	glBindTexture(GL_TEXTURE_2D, state->texture[2]);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, IMAGE_WIDTH, IMAGE_HEIGHT, 0,
-					 GL_RGB, GL_UNSIGNED_BYTE, state->texture_buffer3);
-	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (GLfloat)GL_LINEAR);
-	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (GLfloat)GL_LINEAR);
-	checkgl();
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, IMAGE_WIDTH, IMAGE_HEIGHT, 0,
+					 GL_RGBA, GL_UNSIGNED_BYTE, image_buffer);
+
+	free(image_buffer);
+
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);	
+	
+	/* Create EGL Image */
+	state->egl_image = 0;
+	state->egl_image = eglCreateImageKHR(
+					 state->display,
+					 state->context,
+					 EGL_GL_TEXTURE_2D_KHR,
+					 (EGLClientBuffer)state->texture[2],
+					 0);
+	 
+	if (state->egl_image == EGL_NO_IMAGE_KHR)
+	{
+		printf("eglCreateImageKHR failed.\n");
+		exit(1);
+	}
+	else
+	{
+		if (state->verbose)
+			printf("EGL image created = %x\n", (uint)state->egl_image);
+	}	
+
+	// Start rendering
+	pthread_create(&state->video_thread, NULL, video_decode_test, state->egl_image);	
 
 	if (state->verbose)
-		printf("Textures uploaded\n");
+		printf("Textures ready\n");
 }
-
 
 static void draw_triangles(APP_STATE_T *state)
 {
@@ -414,6 +453,11 @@ static void draw_triangles(APP_STATE_T *state)
 
 	eglSwapBuffers(state->display, state->surface);
 	checkgl();
+}
+
+void set_frame_available()
+{
+	frame_available = 1;
 }
 
 void init_termios(int echo)
@@ -459,6 +503,14 @@ char check_keypress(void)
 static void cleanup(void)
 // Clean up resources
 {
+	pthread_cancel(state->video_thread);
+
+	if (state->egl_image != 0)
+	{
+		if (!eglDestroyImageKHR(state->display, (EGLImageKHR) state->egl_image))
+			printf("eglDestroyImageKHR failed.");
+	}
+
 	// clear screen
 	glClear( GL_COLOR_BUFFER_BIT );
 	eglSwapBuffers(state->display, state->surface);
@@ -474,7 +526,7 @@ static void cleanup(void)
 	free(state->texture_buffer2);
 	free(state->texture_buffer3);
 
-	reset_termios();
+	//reset_termios();
 
 	if (state->verbose)
 		printf("App closed\n");
@@ -496,14 +548,18 @@ int main ()
 	init_shaders(state);
 	init_textures(state);
 
-	init_termios(0);
+	//init_termios(0);
 
 	while (!terminate)
 	{
-		draw_triangles(state);
-
-		if (check_keypress())
-			terminate = 1;
+		if (frame_available)
+		{
+			frame_available = 0;
+			draw_triangles(state);
+		}
+		
+		//if (check_keypress())
+		//	terminate = 1;
 	}
 	cleanup();
 
