@@ -1,4 +1,3 @@
-
 /*
 Copyright (c) 2012, Broadcom Europe Ltd
 All rights reserved.
@@ -29,8 +28,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // OpenGL|ES 2 UV Mapper
 
 #include <stdio.h>
-#include <termios.h>
-#include <poll.h>
 #include <assert.h>
 #include <pthread.h>
 
@@ -40,13 +37,19 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "EGL/egl.h"
 #include "EGL/eglext.h"
 
-#define IMAGE_PATH "test.raw"
-#define IMAGE_WIDTH 1920
-#define IMAGE_HEIGHT 1080
+#define VIDEO_PATH "/opt/vc/src/hello_pi/hello_video/test.h264"
+#define VIDEO_WIDTH 1920
+#define VIDEO_HEIGHT 1080
 
 #define MAP_PATH "map.raw"
 #define MAP_WIDTH 1680
 #define MAP_HEIGHT 1050
+
+typedef struct
+{
+	char* filename;	
+	void* egl_image;
+} VIDEO_INFO;
 
 typedef struct
 {
@@ -72,15 +75,12 @@ typedef struct
 	// pointers to texture buffers
 	char *texture_buffer1;
 	char *texture_buffer2;
-	char *texture_buffer3;
 
 	// video texture
 	void* egl_image;
 	pthread_t video_thread;
 } APP_STATE_T;
-
 static APP_STATE_T _state, *state=&_state;
-static struct termios last_term, my_term;
 
 static int frame_available = 0;
 
@@ -110,15 +110,12 @@ static void show_programlog(GLint shader)
 /***********************************************************
  * Name: init_ogl
  *
- * Arguments:
- *		 APP_STATE_T *state - holds OGLES model info
- *
  * Description: Sets the display, OpenGL|ES context and screen stuff
  *
  * Returns: void
  *
  ***********************************************************/
-static void init_ogl(APP_STATE_T *state)
+static void init_ogl()
 {
 	int32_t success = 0;
 	EGLBoolean result;
@@ -224,7 +221,7 @@ static void init_ogl(APP_STATE_T *state)
 }
 
 
-static void init_shaders(APP_STATE_T *state)
+static void init_shaders()
 {
 	static const GLfloat vertex_data[] = {
 		-1.0,-1.0, 1.0, 1.0,
@@ -304,17 +301,15 @@ static void init_shaders(APP_STATE_T *state)
 }
 
 
-static void load_images(APP_STATE_T *state)
+static void load_map()
 {
 	FILE *file = NULL;
 	int bytes_read, 
-		image_sz = IMAGE_WIDTH*IMAGE_HEIGHT*3,
 		map_sz = MAP_WIDTH*MAP_HEIGHT*4;
 
 	char *map_buffer = malloc(map_sz*2);
 	state->texture_buffer1 = malloc(map_sz);
 	state->texture_buffer2 = malloc(map_sz);
-	state->texture_buffer3 = malloc(image_sz);
 
 	file = fopen(MAP_PATH, "rb");
 	if (file && map_buffer)
@@ -340,10 +335,10 @@ static void load_images(APP_STATE_T *state)
 }
 
 
-static void init_textures(APP_STATE_T *state)
+static void init_textures()
 {
 	// load texture buffers into OGL|ES texture surfaces
-	load_images(state);
+	load_map();
 	glGenTextures(3, &state->texture[0]);
 	checkgl();
 
@@ -364,7 +359,7 @@ static void init_textures(APP_STATE_T *state)
 	checkgl();
 
 	// setup texture for video
-	int image_size = IMAGE_WIDTH * IMAGE_HEIGHT * 4;
+	int image_size = VIDEO_WIDTH * VIDEO_HEIGHT * 4;
 	GLubyte* image_buffer = malloc(image_size);
 	if (image_buffer == 0)
 	{
@@ -375,7 +370,7 @@ static void init_textures(APP_STATE_T *state)
 	memset(image_buffer, 0x00, image_size);  // black transparant
 
 	glBindTexture(GL_TEXTURE_2D, state->texture[2]);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, IMAGE_WIDTH, IMAGE_HEIGHT, 0,
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VIDEO_WIDTH, VIDEO_HEIGHT, 0,
 					 GL_RGBA, GL_UNSIGNED_BYTE, image_buffer);
 
 	free(image_buffer);
@@ -383,7 +378,7 @@ static void init_textures(APP_STATE_T *state)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);	
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	
 	/* Create EGL Image */
 	state->egl_image = 0;
@@ -405,14 +400,20 @@ static void init_textures(APP_STATE_T *state)
 			printf("EGL image created = %x\n", (uint)state->egl_image);
 	}	
 
+	VIDEO_INFO video_info;
+	memset( &video_info, 0, sizeof( video_info ) );
+	char* filename = VIDEO_PATH;
+	video_info.filename = filename;
+	video_info.egl_image = state->egl_image;
+	
 	// Start rendering
-	pthread_create(&state->video_thread, NULL, video_decode_test, state->egl_image);	
+	pthread_create(&state->video_thread, NULL, video_decode_test, &video_info);	
 
 	if (state->verbose)
 		printf("Textures ready\n");
 }
 
-static void draw_triangles(APP_STATE_T *state)
+static void draw_triangles()
 {
 	// Render to the main frame buffer
 	glBindFramebuffer(GL_FRAMEBUFFER,0);
@@ -460,46 +461,6 @@ void set_frame_available()
 	frame_available = 1;
 }
 
-void init_termios(int echo)
-// Initialize new terminal i/o settings
-{
-	tcgetattr(0, &last_term);					 // store terminal i/o settings
-	my_term = last_term;
-	my_term.c_lflag &= ~ICANON;				  // disable buffered i/o
-	my_term.c_lflag &= echo ? ECHO : ~ECHO;  // set echo mode
-	tcsetattr(0, TCSANOW, &my_term);
-}
-
-void reset_termios(void)
-// Restore last_term terminal i/o settings
-{
-	tcsetattr(0, TCSANOW, &last_term);
-}
-
-char check_keypress(void)
-{
-	struct pollfd pfds[1];
-	char c;
-	int ret;
-
-	// See if there is data available
-	pfds[0].fd = 0;
-	pfds[0].events = POLLIN;
-	ret = poll(pfds, 1, 0);
-
-	if (ret > 0)
-	{
-		if (state->verbose)
-			printf("Key pressed\n");
-
-		// Consume data
-		read(0, &c, 1);
-	  return c;
-	}
-
-	return 0;
-}
-
 static void cleanup(void)
 // Clean up resources
 {
@@ -524,9 +485,6 @@ static void cleanup(void)
 	// release texture buffers
 	free(state->texture_buffer1);
 	free(state->texture_buffer2);
-	free(state->texture_buffer3);
-
-	//reset_termios();
 
 	if (state->verbose)
 		printf("App closed\n");
@@ -537,31 +495,27 @@ static void cleanup(void)
 int main ()
 {
 	int terminate = 0;
+	
+	atexit(cleanup);
 	bcm_host_init();
-
+	
 	// Clear application state
 	memset( state, 0, sizeof( *state ) );
 	state->verbose = 1;
 
 	// Start OGLES
-	init_ogl(state);
-	init_shaders(state);
-	init_textures(state);
-
-	//init_termios(0);
+	init_ogl();
+	init_shaders();
+	init_textures();
 
 	while (!terminate)
 	{
 		if (frame_available)
 		{
 			frame_available = 0;
-			draw_triangles(state);
+			draw_triangles();
 		}
-		
-		//if (check_keypress())
-		//	terminate = 1;
 	}
-	cleanup();
 
 	return terminate;
 }

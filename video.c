@@ -26,6 +26,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 // Video deocode demo using OpenMAX IL though the ilcient helper library
+// Modfied to work as pthread from another app
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,10 +35,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "bcm_host.h"
 #include "ilclient.h"
 
+typedef struct
+{
+	char* filename;	
+	void* egl_image;
+} VIDEO_INFO;
+
 static OMX_BUFFERHEADERTYPE* eglBuffer = NULL;
 static COMPONENT_T* video_render = NULL;
-
-static void* eglImage = 0;
 
 // forward declaration
 void set_frame_available();
@@ -55,11 +60,11 @@ void my_fill_buffer_done(void* data, COMPONENT_T* comp)
 }
 
 
-// Modfied function prototype to work with pthreads
-void* video_decode_test(void* arg)
+
+void* video_decode_test(VIDEO_INFO* arg)
 {
-	const char* filename = "/opt/vc/src/hello_pi/hello_video/test.h264";
-	eglImage = arg;
+	VIDEO_INFO videoInfo = *arg;
+	void* eglImage = videoInfo.egl_image;
 
 	if (eglImage == 0)
 	{
@@ -83,7 +88,7 @@ void* video_decode_test(void* arg)
 	memset(list, 0, sizeof(list));
 	memset(tunnel, 0, sizeof(tunnel));
 
-	if((in = fopen(filename, "rb")) == NULL)
+	if((in = fopen(videoInfo.filename, "rb")) == NULL)
 		return (void *)-2;
 
 	if((client = ilclient_init()) == NULL)
@@ -119,7 +124,6 @@ void* video_decode_test(void* arg)
 	list[0] = video_decode;
 
 	// create video_render
-	//if(status == 0 && ilclient_create_component(client, &video_render, "video_render", ILCLIENT_DISABLE_ALL_PORTS) != 0)
 	if(status == 0 && ilclient_create_component(client, &video_render, "egl_render", ILCLIENT_DISABLE_ALL_PORTS | ILCLIENT_ENABLE_OUTPUT_BUFFERS) != 0)
 		status = -14;
 	list[1] = video_render;
@@ -143,7 +147,6 @@ void* video_decode_test(void* arg)
 	list[3] = video_scheduler;
 
 	set_tunnel(tunnel, video_decode, 131, video_scheduler, 10);
-	//set_tunnel(tunnel+1, video_scheduler, 11, video_render, 90);
 	set_tunnel(tunnel+1, video_scheduler, 11, video_render, 220);
 	set_tunnel(tunnel+2, clock, 80, video_scheduler, 12);
 
@@ -177,9 +180,9 @@ void* video_decode_test(void* arg)
 			// feed data and wait until we get port settings changed
 			unsigned char *dest = find_start_codes ? data + data_len : buf->pBuffer;
 
-		 // loop if at end
-		 if (feof(in))
-			rewind(in);
+			// loop if at end
+			if (feof(in))
+				rewind(in);
 
 			data_len += fread(dest, 1, packet_size+(find_start_codes*4)-data_len, in);
 
@@ -206,35 +209,35 @@ void* video_decode_test(void* arg)
 				}
 
 
-			// Set egl_render to idle
-			ilclient_change_component_state(video_render, OMX_StateIdle);
+				// Set egl_render to idle
+				ilclient_change_component_state(video_render, OMX_StateIdle);
 
 
-			// Enable the output port and tell egl_render to use the texture as a buffer
-			//ilclient_enable_port(video_render, 221); THIS BLOCKS SO CANT BE USED
-			if (OMX_SendCommand(ILC_GET_HANDLE(video_render), OMX_CommandPortEnable, 221, NULL) != OMX_ErrorNone)
-			{
-				printf("OMX_CommandPortEnable failed.\n");
-				exit(1);
-			}
+				// Enable the output port and tell egl_render to use the texture as a buffer
+				//ilclient_enable_port(video_render, 221); THIS BLOCKS SO CANT BE USED
+				if (OMX_SendCommand(ILC_GET_HANDLE(video_render), OMX_CommandPortEnable, 221, NULL) != OMX_ErrorNone)
+				{
+					printf("OMX_CommandPortEnable failed.\n");
+					exit(1);
+				}
 
-			if (OMX_UseEGLImage(ILC_GET_HANDLE(video_render), &eglBuffer, 221, NULL, eglImage) != OMX_ErrorNone)
-			{
-				printf("OMX_UseEGLImage failed.\n");
-				exit(1);
-			}
-
-
-			// Set egl_render to executing
-			ilclient_change_component_state(video_render, OMX_StateExecuting);
+				if (OMX_UseEGLImage(ILC_GET_HANDLE(video_render), &eglBuffer, 221, NULL, eglImage) != OMX_ErrorNone)
+				{
+					printf("OMX_UseEGLImage failed.\n");
+					exit(1);
+				}
 
 
-			// Request egl_render to write data to the texture buffer
-			if(OMX_FillThisBuffer(ILC_GET_HANDLE(video_render), eglBuffer) != OMX_ErrorNone)
-			{
-				printf("OMX_FillThisBuffer failed.\n");
-				exit(1);
-			}
+				// Set egl_render to executing
+				ilclient_change_component_state(video_render, OMX_StateExecuting);
+
+
+				// Request egl_render to write data to the texture buffer
+				if(OMX_FillThisBuffer(ILC_GET_HANDLE(video_render), eglBuffer) != OMX_ErrorNone)
+				{
+					printf("OMX_FillThisBuffer failed.\n");
+					exit(1);
+				}
 			}
 			if(!data_len)
 				break;
