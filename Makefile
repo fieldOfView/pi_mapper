@@ -1,5 +1,5 @@
-OBJS=triangle2.o
-BIN=hello_triangle2.bin
+OBJS=mapper.o
+BIN=uvmapper.bin
 
 include ../Makefile.include
 
