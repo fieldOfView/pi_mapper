@@ -48,6 +48,7 @@ typedef struct
 
 typedef struct
 {
+	int status;
 	bool verbose;
 	
 	uint32_t screen_width;
@@ -602,6 +603,11 @@ void set_frame_available()
 	state->frame_available = 1;
 }
 
+void set_status(int status)
+{
+	state->status = status;
+}
+
 static void cleanup(void)
 // Clean up resources
 {
@@ -631,13 +637,12 @@ static void cleanup(void)
 
 int main (int argc, char **argv)
 {
-	int terminate = 0;
+	// Clear application state
+	memset( state, 0, sizeof( *state ) );
+	state->status = 0;
 	
 	atexit(cleanup);
 	bcm_host_init();
-	
-	// Clear application state
-	memset( state, 0, sizeof( *state ) );
 
 	if (argc < 3) {
 		printf("Usage: %s [OPTION] <mapfile> <moviefile>\n", argv[0]);
@@ -662,7 +667,7 @@ int main (int argc, char **argv)
 	
 	start_rendering(argv[argc-1], loop);
 
-	while (!terminate)
+	while (state->status == 0)
 	{
 		if (state->frame_available)
 		{
@@ -671,5 +676,5 @@ int main (int argc, char **argv)
 		}
 	}
 
-	return terminate;
+	return state->status;
 }

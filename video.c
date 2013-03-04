@@ -45,21 +45,26 @@ typedef struct
 
 static OMX_BUFFERHEADERTYPE* eglBuffer = NULL;
 static COMPONENT_T* video_render = NULL;
+static int status = 0;
 
 // forward declaration
 void set_frame_available();
+void set_status(int status);
 
 
 void my_fill_buffer_done(void* data, COMPONENT_T* comp)
 {
 	//printf("FillBufferDoneCallback");
-	if (OMX_FillThisBuffer(ilclient_get_handle(video_render), eglBuffer) != OMX_ErrorNone)
+	if (status == 0)
 	{
-		printf("OMX_FillThisBuffer failed in callback\n");
-		exit(1);
-	}
+		if (OMX_FillThisBuffer(ilclient_get_handle(video_render), eglBuffer) != OMX_ErrorNone)
+		{
+			printf("OMX_FillThisBuffer failed in callback\n");
+			exit(1);
+		}
 
-	set_frame_available();
+		set_frame_available();
+	}
 }
 
 
@@ -81,7 +86,6 @@ void* video_decode(VIDEO_INFO* arg)
 	TUNNEL_T tunnel[4];
 	ILCLIENT_T *client;
 	FILE *in;
-	int status = 0;
 	unsigned int data_len = 0;
 	int packet_size = 16<<10;
 
@@ -173,8 +177,16 @@ void* video_decode(VIDEO_INFO* arg)
 
 			// loop if at end
 			if (feof(in))
-				rewind(in);
-
+			{
+				if(videoInfo.loop)
+					rewind(in);
+				else
+				{	
+					status = -1;
+					break;
+				}
+			}
+				
 			data_len += fread(dest, 1, packet_size-data_len, in);
 
 			if(port_settings_changed == 0 &&
@@ -230,6 +242,7 @@ void* video_decode(VIDEO_INFO* arg)
 					exit(1);
 				}
 			}
+			
 			if(!data_len)
 				break;
 
@@ -260,14 +273,16 @@ void* video_decode(VIDEO_INFO* arg)
 			status = -20;
 
 		// wait for EOS from render
-		ilclient_wait_for_event(video_render, OMX_EventBufferFlag, 90, 0, OMX_BUFFERFLAG_EOS, 0,
-										ILCLIENT_BUFFER_FLAG_EOS, 10000);
-
+		//ilclient_wait_for_event(video_render, OMX_EventBufferFlag, 90, 0, OMX_BUFFERFLAG_EOS, 0,
+		//								ILCLIENT_BUFFER_FLAG_EOS, 10000);
+		
 		// need to flush the renderer to allow video_decode to disable its input port
 		ilclient_flush_tunnels(tunnel, 0);
-
+		
 		ilclient_disable_port_buffers(video_decode, 130, NULL, NULL, NULL);
 	}
+	
+	set_status(status);
 
 	fclose(in);
 
@@ -378,7 +393,7 @@ int video_decode_dimensions(char *filename, int *frame_width, int *frame_height)
 		}
 
 	}
-	close(in);
+	fclose(in);
 
 	ilclient_state_transition(list, OMX_StateIdle);
 	ilclient_cleanup_components(list);
